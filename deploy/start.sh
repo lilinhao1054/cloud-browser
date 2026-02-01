@@ -18,25 +18,16 @@ echo "部署时间: $(date)"
 echo "根目录: $ROOT_DIR"
 echo ""
 
-# 环境变量配置
-export_browser_manager_server_env() {
-    export HOST=127.0.0.1
-    export PORT=5000
-}
-
-export_cloud_browser_server_env() {
-    export HOST=0.0.0.0
-    export PORT=4000
-    export BROWSER_ENDPOINT_HOST=127.0.0.1
-    export BROWSER_ENDPOINT_PORT=5000
-}
-
-export_cloud_browser_sdk_env() {
-    export HOST=0.0.0.0
-    export PORT=3000
-    export VITE_SDK_SERVER_URL=http://127.0.0.1:4000
-    export VITE_API_BASE_URL=http://127.0.0.1:4000
-}
+# 加载环境变量
+ENV_FILE="$SCRIPT_DIR/.env"
+if [ ! -f "$ENV_FILE" ]; then
+    echo -e "${RED}环境变量文件不存在: $ENV_FILE${NC}"
+    echo "请复制 .env-template 为 .env 并修改配置"
+    exit 1
+fi
+set -a
+source "$ENV_FILE"
+set +a
 
 # 要部署的项目（按依赖顺序：manager -> server -> sdk）
 PROJECTS=("browser-manager-server" "cloud-browser-server" "cloud-browser-sdk")
@@ -57,19 +48,6 @@ for project in "${PROJECTS[@]}"; do
     echo -e "${BLUE}========================================${NC}"
     echo -e "${BLUE}[$project]${NC} 开始部署..."
     echo -e "${BLUE}========================================${NC}"
-    
-    # 根据项目名注入对应环境变量
-    case "$project" in
-        "browser-manager-server")
-            export_browser_manager_server_env
-            ;;
-        "cloud-browser-server")
-            export_cloud_browser_server_env
-            ;;
-        "cloud-browser-sdk")
-            export_cloud_browser_sdk_env
-            ;;
-    esac
     
     # 部署失败立即退出
     cd "$ROOT_DIR/$project" && bash deploy/start.sh
