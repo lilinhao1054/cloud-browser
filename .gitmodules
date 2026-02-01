@@ -1,0 +1,9 @@
+[submodule "browser-manager-server"]
+	path = browser-manager-server
+	url = git@git.woa.com:harlowli/browser-manager-server.git
+[submodule "cloud-browser-sdk"]
+	path = cloud-browser-sdk
+	url = git@git.woa.com:harlowli/cloud-browser-sdk.git
+[submodule "cloud-browser-server"]
+	path = cloud-browser-server
+	url = git@git.woa.com:harlowli/cloud-browser-server.git
