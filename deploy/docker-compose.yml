@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  # 浏览器管理服务 - 管理 Puppeteer 浏览器实例（仅内部访问）
+  browser-manager-server:
+    build:
+      context: ../browser-manager-server
+      dockerfile: Dockerfile
+    container_name: browser-manager-server
+    restart: unless-stopped
+    expose:
+      - "5000"
+    environment:
+      - NODE_ENV=production
+      - MAX_BROWSERS=${MAX_BROWSERS}
+      - BROWSER_TIMEOUT=${BROWSER_TIMEOUT}
+      - CHROME_NO_SANDBOX=true
+    # Chrome 需要更大的共享内存，默认 64MB 太小会导致崩溃
+    shm_size: '2gb'
+    volumes:
+      - ./logs/browser-manager:/app/logs
+    networks:
+      - cloud-browser-network
+
+  # 云浏览器服务 - 提供 WebSocket 和 API
+  cloud-browser-server:
+    build:
+      context: ../cloud-browser-server
+      dockerfile: Dockerfile
+    container_name: cloud-browser-server
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - NODE_ENV=production
+      - BROWSER_ENDPOINT_HOST=browser-manager-server
+      - BROWSER_ENDPOINT_PORT=5000
+      - SCREENCAST_QUALITY=${SCREENCAST_QUALITY}
+      - SCREENCAST_EVERY_NTH_FRAME=${SCREENCAST_EVERY_NTH_FRAME}
+    volumes:
+      - ./logs/cloud-browser-server:/app/logs
+    depends_on:
+      - browser-manager-server
+    networks:
+      - cloud-browser-network
+
+  # 云浏览器 SDK Demo - 前端界面
+  # 注意：VITE_* 是构建时变量，SDK 在浏览器中运行，需要用宿主机可访问的地址
+  cloud-browser-sdk:
+    build:
+      context: ../cloud-browser-sdk
+      dockerfile: Dockerfile
+      args:
+        - VITE_SDK_SERVER_URL=${VITE_SDK_SERVER_URL}
+        - VITE_API_BASE_URL=${VITE_API_BASE_URL}
+    container_name: cloud-browser-sdk
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - cloud-browser-server
+    networks:
+      - cloud-browser-network
+
+networks:
+  cloud-browser-network:
+    driver: bridge
