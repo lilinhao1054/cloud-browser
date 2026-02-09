@@ -1,0 +1,33 @@
+{
+  "name": "cloud-browser-server",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "ts-node-dev --respawn src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@koa/multer": "^4.0.0",
+    "@types/koa-bodyparser": "^4.3.13",
+    "chrome-remote-interface": "^0.33.2",
+    "dotenv": "^17.2.3",
+    "koa": "^2.15.3",
+    "koa-bodyparser": "^4.4.1",
+    "koa-cors": "^0.0.16",
+    "koa-router": "^12.0.1",
+    "multer": "^2.0.2",
+    "socket.io": "^4.7.4",
+    "winston": "^3.19.0"
+  },
+  "devDependencies": {
+    "@types/chrome-remote-interface": "^0.31.14",
+    "@types/koa": "^2.15.0",
+    "@types/koa__multer": "^2.0.8",
+    "@types/koa-cors": "^0.0.5",
+    "@types/koa-router": "^7.4.8",
+    "@types/multer": "^2.0.0",
+    "@types/node": "^20.14.10",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.5.3"
+  }
+}

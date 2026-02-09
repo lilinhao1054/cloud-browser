@@ -1,0 +1,9 @@
+node_modules
+dist
+dist-demo
+logs
+*.log
+.env
+.env.local
+.DS_Store
+deploy
