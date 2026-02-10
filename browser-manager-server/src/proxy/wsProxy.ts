@@ -30,29 +30,12 @@ export function setupWsProxy(server: http.Server): void {
     const targetUrl = new URL(wsEndpoint);
 
     // /browser?token=xxx => 代理到浏览器的 wsEndpoint
+    // 使用 flatten 模式，所有页面通过 sessionId 多路复用，无需单独的页面 ws 端点
     if (url.pathname === '/browser') {
       req.url = targetUrl.pathname;
       req.headers.host = targetUrl.host;
 
       logger.info(`Browser WS proxy: ${url.pathname} => ${wsEndpoint}`);
-
-      wsProxy.ws(req, socket, head, {
-        target: `ws://${targetUrl.host}`,
-        ws: true,
-      });
-      return;
-    }
-
-    // /page/${targetId}?token=xxx => 代理到页面的 devtools ws
-    const pageMatch = url.pathname.match(/^\/page\/(.+)$/);
-    if (pageMatch) {
-      const targetId = pageMatch[1];
-      const pageWsPath = `/devtools/page/${targetId}`;
-
-      req.url = pageWsPath;
-      req.headers.host = targetUrl.host;
-
-      logger.info(`Page WS proxy: ${url.pathname} => ws://${targetUrl.host}${pageWsPath}`);
 
       wsProxy.ws(req, socket, head, {
         target: `ws://${targetUrl.host}`,

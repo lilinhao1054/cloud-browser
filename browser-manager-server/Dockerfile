@@ -2,11 +2,11 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# 复制 package 文件
-COPY package*.json ./
+# 复制 package.json
+COPY package.json ./
 
 # 安装所有依赖（包含 devDependencies 用于构建）
-RUN npm ci
+RUN npm install
 
 # 复制源码
 COPY . .
@@ -28,16 +28,15 @@ RUN apk add --no-cache \
     font-noto-cjk
 
 # 设置 Puppeteer 环境变量
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 WORKDIR /app
 
-# 复制 package 文件
-COPY package*.json ./
+# 复制 package.json
+COPY package.json ./
 
 # 只安装生产依赖
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 # 从构建阶段复制编译产物
 COPY --from=builder /app/dist ./dist

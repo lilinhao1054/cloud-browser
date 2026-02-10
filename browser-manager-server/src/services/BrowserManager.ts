@@ -1,4 +1,4 @@
-import puppeteer, { Browser } from 'puppeteer';
+import puppeteer, { Browser } from 'puppeteer-core';
 import { randomUUID } from 'crypto';
 import logger from '../utils/logger';
 
@@ -68,6 +68,7 @@ export class BrowserManager {
 
     const token = randomUUID();
     const browser = await puppeteer.launch({
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser',
       headless: true,
       args: [
         '--remote-allow-origins=*',

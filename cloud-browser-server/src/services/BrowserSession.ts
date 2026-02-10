@@ -7,10 +7,11 @@ import { logger } from '../utils';
 /**
  * 浏览器会话管理类
  * 负责管理与远程浏览器的 CDP 连接和交互
+ * 使用单 WebSocket 连接 + sessionId 多路复用模式
  */
 export class BrowserSession {
-  private client: CDP.Client | null = null;
   private browserClient: CDP.Client | null = null;
+  private sessionId: string | null = null;  // 当前页面的 sessionId
   private targetId: string | null = null;
   private currentUrl: string = '';
   private token: string = '';
@@ -19,6 +20,9 @@ export class BrowserSession {
   private viewerClients: Set<BaseClient> = new Set();
   private apiClients: Set<BaseClient> = new Set();
   private screencastStarted: boolean = false;
+
+  // 追踪当前按下的修饰键
+  private pressedModifiers: Set<string> = new Set();
 
   constructor() {}
 
@@ -122,6 +126,34 @@ export class BrowserSession {
   }
 
   /**
+   * 通过 sessionId 发送 CDP 命令到当前页面
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async send<T = any>(method: string, params: object = {}): Promise<T> {
+    if (!this.browserClient || !this.sessionId) {
+      throw new Error('Browser not connected');
+    }
+    return this.sendToSession<T>(this.browserClient, method, params, this.sessionId);
+  }
+
+  /**
+   * 发送 CDP 命令到指定 session（包装回调为 Promise）
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private sendToSession<T = any>(client: CDP.Client, method: string, params: object, sessionId: string): Promise<T> {
+    return new Promise((resolve, reject) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (client as any).send(method, params, sessionId, (error: Error | null, result: T) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve(result);
+        }
+      });
+    });
+  }
+
+  /**
    * 通过检查 document.visibilityState 找到当前活跃的页面
    */
   private async findActiveTarget(): Promise<string | null> {
@@ -134,19 +166,22 @@ export class BrowserSession {
 
     for (const page of pages) {
       try {
-        const tempClient = await CDP({
-          local: true,
-          target: `ws://${END_POINT_HOST}:${END_POINT_PORT}/page/${page.targetId}?token=${this.token}`
+        // 临时 attach 检查 visibility
+        const { sessionId } = await this.browserClient.Target.attachToTarget({
+          targetId: page.targetId,
+          flatten: true,
         });
 
-        await tempClient.Runtime.enable();
+        await this.sendToSession(this.browserClient, 'Runtime.enable', {}, sessionId);
 
-        const result = await tempClient.Runtime.evaluate({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const result = await this.sendToSession<any>(this.browserClient, 'Runtime.evaluate', {
           expression: 'document.visibilityState',
           returnByValue: true,
-        });
+        }, sessionId);
 
-        await tempClient.close();
+        // detach 临时 session
+        await this.browserClient.Target.detachFromTarget({ sessionId });
 
         if (result.result.value === 'visible') {
           logger.debug(`Found active page by visibilityState: ${page.targetId} ${page.url}`);
@@ -167,31 +202,36 @@ export class BrowserSession {
   }
 
   /**
-   * 连接到指定页面并初始化
+   * 连接到指定页面并初始化（使用 flatten 模式）
    */
   private async connectToPage(targetId: string): Promise<void> {
-    this.client = await CDP({
-      local: true,
-      target: `ws://${END_POINT_HOST}:${END_POINT_PORT}/page/${targetId}?token=${this.token}`
+    if (!this.browserClient) {
+      throw new Error('Browser client not connected');
+    }
+
+    // 使用 flatten 模式 attach 到目标页面
+    const { sessionId } = await this.browserClient.Target.attachToTarget({
+      targetId,
+      flatten: true,
     });
+    
+    this.sessionId = sessionId;
     this.targetId = targetId;
 
-    const { Page, Runtime } = this.client;
+    // 启用必要的域
+    await this.send('Page.enable');
+    await this.send('Runtime.enable');
 
-    await Page.enable();
-    await Runtime.enable();
-
-    Page.frameNavigated((params) => {
-      if (params.frame.parentId === undefined) {
-        this.currentUrl = params.frame.url;
-        this.emitToViewers('browser:urlChanged', this.currentUrl);
-      }
-    });
-
-    const { frameTree } = await Page.getFrameTree();
+    // 监听页面导航事件
+    // 注意：使用 flatten 模式时，事件会通过 browserClient 的事件回调接收
+    // 需要在 browserClient 上监听带 sessionId 的事件
+    
+    // 获取当前 URL
+    const { frameTree } = await this.send<{ frameTree: { frame: { url: string } } }>('Page.getFrameTree');
     this.currentUrl = frameTree.frame.url;
 
-    await this.client.Emulation.setDeviceMetricsOverride(DEFAULT_VIEWPORT);
+    // 设置视口
+    await this.send('Emulation.setDeviceMetricsOverride', DEFAULT_VIEWPORT);
 
     // 只在有 viewer 时启动 screencast
     if (this.viewerClients.size > 0) {
@@ -215,6 +255,14 @@ export class BrowserSession {
       });
 
       await this.browserClient.Target.setDiscoverTargets({ discover: true });
+
+      // 监听页面事件（通过 flatten 模式，所有页面事件都通过这里接收）
+      this.browserClient.on('event', (event: { method: string; params: unknown; sessionId?: string }) => {
+        // 只处理当前 session 的事件
+        if (event.sessionId && event.sessionId === this.sessionId) {
+          this.handlePageEvent(event.method, event.params);
+        }
+      });
 
       // 监听新页面创建
       this.browserClient.Target.targetCreated(async (params) => {
@@ -291,6 +339,34 @@ export class BrowserSession {
   }
 
   /**
+   * 处理页面事件（从 flatten 模式的事件流中接收）
+   */
+  private handlePageEvent(method: string, params: unknown): void {
+    switch (method) {
+      case 'Page.frameNavigated': {
+        const frameParams = params as { frame: { parentId?: string; url: string } };
+        if (frameParams.frame.parentId === undefined) {
+          this.currentUrl = frameParams.frame.url;
+          this.emitToViewers('browser:urlChanged', this.currentUrl);
+        }
+        break;
+      }
+      case 'Page.screencastFrame': {
+        const frameData = params as { data: string; sessionId: number };
+        this.emitToViewers('browser:frame', frameData.data);
+        // 发送 ack
+        this.send('Page.screencastFrameAck', { sessionId: frameData.sessionId }).catch(() => {});
+        break;
+      }
+      case 'Page.screencastVisibilityChanged': {
+        const visibility = params as { visible: boolean };
+        logger.debug(`Screencast visibility changed: ${visibility.visible}`);
+        break;
+      }
+    }
+  }
+
+  /**
    * 发送页面列表到所有 viewer 客户端
    */
   private async emitPageList(): Promise<void> {
@@ -319,18 +395,18 @@ export class BrowserSession {
     try {
       logger.debug(`Switching to page: ${targetId}`);
 
-      if (this.client) {
+      // 先停止当前页面的 screencast 并 detach
+      if (this.sessionId && this.browserClient) {
         try {
-          await this.client.Page.stopScreencast();
+          await this.send('Page.stopScreencast');
         } catch (e) {
           // 忽略停止错误
         }
         try {
-          await this.client.close();
+          await this.browserClient.Target.detachFromTarget({ sessionId: this.sessionId });
         } catch (e) {
-          // 忽略关闭错误
+          // 忽略 detach 错误
         }
-        this.client = null;
         this.screencastStarted = false;
       }
 
@@ -344,6 +420,9 @@ export class BrowserSession {
 
       await this.connectToPage(targetId);
 
+      // 切换后主动推送一帧截图，避免静态页面不更新的问题
+      await this.pushInitialFrame();
+
       this.emitToViewers('browser:pageSwitched', {
         targetId,
         url: this.currentUrl,
@@ -355,6 +434,30 @@ export class BrowserSession {
     } catch (error) {
       logger.error('Failed to switch page:', error);
       this.emitToViewers('browser:error', (error as Error).message);
+    }
+  }
+
+  /**
+   * 主动推送一帧截图
+   * 用于切换页面后立即显示新页面内容，避免等待 screencast 推送
+   */
+  private async pushInitialFrame(): Promise<void> {
+    if (!this.sessionId || this.viewerClients.size === 0) return;
+
+    try {
+      // 使用与 screencast 相同的格式和质量
+      const result = await this.send<{ data: string }>('Page.captureScreenshot', {
+        format: 'jpeg',
+        quality: 60,
+      });
+
+      if (result?.data) {
+        this.emitToViewers('browser:frame', result.data);
+        logger.debug('Pushed initial frame after page switch');
+      }
+    } catch (error) {
+      logger.warn('Failed to push initial frame:', error);
+      // 不抛出错误，这只是优化，失败不影响主流程
     }
   }
 
@@ -392,14 +495,14 @@ export class BrowserSession {
    * 导航到指定 URL
    */
   async navigate(url: string): Promise<void> {
-    if (!this.client) {
+    if (!this.sessionId) {
       this.emitToViewers('browser:error', 'Browser not connected');
       return;
     }
 
     try {
       logger.debug(`Navigating to ${url}...`);
-      await this.client.Page.navigate({ url });
+      await this.send('Page.navigate', { url });
     } catch (error) {
       logger.error('Navigation error:', error);
       this.emitToViewers('browser:error', (error as Error).message);
@@ -410,11 +513,11 @@ export class BrowserSession {
    * 后退
    */
   async goBack(): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
-      const { currentIndex, entries } = await this.client.Page.getNavigationHistory();
+      const { currentIndex, entries } = await this.send<{ currentIndex: number; entries: { id: number }[] }>('Page.getNavigationHistory');
       if (currentIndex > 0) {
-        await this.client.Page.navigateToHistoryEntry({ entryId: entries[currentIndex - 1].id });
+        await this.send('Page.navigateToHistoryEntry', { entryId: entries[currentIndex - 1].id });
       }
     } catch (error) {
       logger.error('Go back error:', error);
@@ -425,11 +528,11 @@ export class BrowserSession {
    * 前进
    */
   async goForward(): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
-      const { currentIndex, entries } = await this.client.Page.getNavigationHistory();
+      const { currentIndex, entries } = await this.send<{ currentIndex: number; entries: { id: number }[] }>('Page.getNavigationHistory');
       if (currentIndex < entries.length - 1) {
-        await this.client.Page.navigateToHistoryEntry({ entryId: entries[currentIndex + 1].id });
+        await this.send('Page.navigateToHistoryEntry', { entryId: entries[currentIndex + 1].id });
       }
     } catch (error) {
       logger.error('Go forward error:', error);
@@ -440,9 +543,9 @@ export class BrowserSession {
    * 刷新页面
    */
   async reload(): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
-      await this.client.Page.reload();
+      await this.send('Page.reload');
     } catch (error) {
       logger.error('Reload error:', error);
     }
@@ -452,17 +555,16 @@ export class BrowserSession {
    * 鼠标点击
    */
   async clickAt(x: number, y: number): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
-      const { Input } = this.client;
-      await Input.dispatchMouseEvent({
+      await this.send('Input.dispatchMouseEvent', {
         type: 'mousePressed',
         x,
         y,
         button: 'left',
         clickCount: 1,
       });
-      await Input.dispatchMouseEvent({
+      await this.send('Input.dispatchMouseEvent', {
         type: 'mouseReleased',
         x,
         y,
@@ -478,9 +580,9 @@ export class BrowserSession {
    * 鼠标移动
    */
   async mouseMove(x: number, y: number): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
-      await this.client.Input.dispatchMouseEvent({
+      await this.send('Input.dispatchMouseEvent', {
         type: 'mouseMoved',
         x,
         y,
@@ -494,9 +596,9 @@ export class BrowserSession {
    * 鼠标滚动
    */
   async scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
-      await this.client.Input.dispatchMouseEvent({
+      await this.send('Input.dispatchMouseEvent', {
         type: 'mouseWheel',
         x,
         y,
@@ -508,15 +610,69 @@ export class BrowserSession {
     }
   }
 
+  // 修饰键配置
+  private static readonly MODIFIER_KEYS = {
+    Control: { code: 'ControlLeft', keyCode: 17 },
+    Alt: { code: 'AltLeft', keyCode: 18 },
+    Shift: { code: 'ShiftLeft', keyCode: 16 },
+  } as const;
+
+  /**
+   * 发送修饰键事件
+   */
+  private async dispatchModifierKey(
+    type: 'keyDown' | 'keyUp',
+    key: keyof typeof BrowserSession.MODIFIER_KEYS,
+    modifiers: number
+  ): Promise<void> {
+    const config = BrowserSession.MODIFIER_KEYS[key];
+    await this.send('Input.dispatchKeyEvent', {
+      type,
+      key,
+      code: config.code,
+      modifiers,
+      windowsVirtualKeyCode: config.keyCode,
+      nativeVirtualKeyCode: config.keyCode,
+    });
+  }
+
+  /**
+   * 获取当前修饰键状态的 flags
+   */
+  private getCurrentModifierFlags(getModifierFlags: (m: KeyModifiers) => number): number {
+    return getModifierFlags({
+      ctrl: this.pressedModifiers.has('Control'),
+      alt: this.pressedModifiers.has('Alt'),
+      meta: false,
+      shift: this.pressedModifiers.has('Shift'),
+    });
+  }
+
   /**
    * 键盘按下
    */
   async keyDown(key: string, code: string, modifiers: KeyModifiers): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
       const { getModifierFlags, getKeyCode } = await import('../utils');
+
+      // 按下需要的修饰键（追踪状态）
+      if ((modifiers.ctrl || modifiers.meta) && !this.pressedModifiers.has('Control')) {
+        await this.dispatchModifierKey('keyDown', 'Control', 0);
+        this.pressedModifiers.add('Control');
+      }
+      if (modifiers.alt && !this.pressedModifiers.has('Alt')) {
+        await this.dispatchModifierKey('keyDown', 'Alt', this.getCurrentModifierFlags(getModifierFlags));
+        this.pressedModifiers.add('Alt');
+      }
+      if (modifiers.shift && !this.pressedModifiers.has('Shift')) {
+        await this.dispatchModifierKey('keyDown', 'Shift', this.getCurrentModifierFlags(getModifierFlags));
+        this.pressedModifiers.add('Shift');
+      }
+
+      // 按下主键
       const modifierFlags = getModifierFlags(modifiers);
-      await this.client.Input.dispatchKeyEvent({
+      await this.send('Input.dispatchKeyEvent', {
         type: 'keyDown',
         key,
         code,
@@ -526,7 +682,7 @@ export class BrowserSession {
       });
 
       if (key.length === 1) {
-        await this.client.Input.dispatchKeyEvent({
+        await this.send('Input.dispatchKeyEvent', {
           type: 'char',
           text: key,
           key,
@@ -543,11 +699,13 @@ export class BrowserSession {
    * 键盘释放
    */
   async keyUp(key: string, code: string, modifiers: KeyModifiers): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
       const { getModifierFlags, getKeyCode } = await import('../utils');
+
+      // 释放主键
       const modifierFlags = getModifierFlags(modifiers);
-      await this.client.Input.dispatchKeyEvent({
+      await this.send('Input.dispatchKeyEvent', {
         type: 'keyUp',
         key,
         code,
@@ -555,6 +713,20 @@ export class BrowserSession {
         windowsVirtualKeyCode: getKeyCode(key, code),
         nativeVirtualKeyCode: getKeyCode(key, code),
       });
+
+      // 释放不再需要的修饰键（顺序与按下相反）
+      if (!modifiers.shift && this.pressedModifiers.has('Shift')) {
+        this.pressedModifiers.delete('Shift');
+        await this.dispatchModifierKey('keyUp', 'Shift', this.getCurrentModifierFlags(getModifierFlags));
+      }
+      if (!modifiers.alt && this.pressedModifiers.has('Alt')) {
+        this.pressedModifiers.delete('Alt');
+        await this.dispatchModifierKey('keyUp', 'Alt', this.getCurrentModifierFlags(getModifierFlags));
+      }
+      if (!(modifiers.ctrl || modifiers.meta) && this.pressedModifiers.has('Control')) {
+        this.pressedModifiers.delete('Control');
+        await this.dispatchModifierKey('keyUp', 'Control', 0);
+      }
     } catch (error) {
       logger.error('KeyUp error:', error);
     }
@@ -564,9 +736,9 @@ export class BrowserSession {
    * 设置 IME 组合文本
    */
   async imeSetComposition(text: string, selectionStart: number, selectionEnd: number): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
-      await this.client.Input.imeSetComposition({
+      await this.send('Input.imeSetComposition', {
         text,
         selectionStart,
         selectionEnd,
@@ -580,9 +752,9 @@ export class BrowserSession {
    * 提交 IME 输入
    */
   async imeCommitComposition(text: string): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
-      await this.client.Input.insertText({ text });
+      await this.send('Input.insertText', { text });
     } catch (error) {
       logger.error('IME commit composition error:', error);
     }
@@ -592,9 +764,9 @@ export class BrowserSession {
    * 直接插入文本
    */
   async insertText(text: string): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
-      await this.client.Input.insertText({ text });
+      await this.send('Input.insertText', { text });
     } catch (error) {
       logger.error('Insert text error:', error);
     }
@@ -606,10 +778,11 @@ export class BrowserSession {
    * @param compressed 是否返回压缩的文本格式（默认 true）
    */
   async getSnapshot(interestingOnly: boolean = true, compressed: boolean = true): Promise<{ snapshot: unknown } | null> {
-    if (!this.client) return null;
+    if (!this.sessionId) return null;
     try {
-      await this.client.Accessibility.enable();
-      const result = await this.client.Accessibility.getFullAXTree();
+      await this.send('Accessibility.enable');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = await this.send<{ nodes: any[] }>('Accessibility.getFullAXTree');
       
       let nodes = result.nodes;
       
@@ -1012,15 +1185,13 @@ export class BrowserSession {
    * @param backendNodeId 元素的 backendDOMNodeId，来自 accessibility snapshot
    */
   async click(backendNodeId: number): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
-      const { DOM, Input } = this.client;
-      
       // 启用 DOM
-      await DOM.enable();
+      await this.send('DOM.enable');
       
       // 通过 backendNodeId 获取元素的盒模型
-      const boxModel = await DOM.getBoxModel({ backendNodeId });
+      const boxModel = await this.send<{ model: { content: number[] } }>('DOM.getBoxModel', { backendNodeId });
       
       if (!boxModel || !boxModel.model || !boxModel.model.content) {
         throw new Error(`Element with backendNodeId ${backendNodeId} not found or has no box model`);
@@ -1035,14 +1206,14 @@ export class BrowserSession {
       logger.info(`Click element backendNodeId=${backendNodeId} at (${centerX}, ${centerY})`);
       
       // 执行点击
-      await Input.dispatchMouseEvent({
+      await this.send('Input.dispatchMouseEvent', {
         type: 'mousePressed',
         x: centerX,
         y: centerY,
         button: 'left',
         clickCount: 1,
       });
-      await Input.dispatchMouseEvent({
+      await this.send('Input.dispatchMouseEvent', {
         type: 'mouseReleased',
         x: centerX,
         y: centerY,
@@ -1061,18 +1232,16 @@ export class BrowserSession {
    * @param value 要填充的值
    */
   async fill(backendNodeId: number, value: string): Promise<void> {
-    if (!this.client) return;
+    if (!this.sessionId) return;
     try {
-      const { DOM, Input } = this.client;
-      
       // 启用 DOM
-      await DOM.enable();
+      await this.send('DOM.enable');
       
       // focus 到目标元素 (使用 backendNodeId)
-      await DOM.focus({ backendNodeId });
+      await this.send('DOM.focus', { backendNodeId });
       
       // 先清空现有内容（全选后删除）
-      await Input.dispatchKeyEvent({
+      await this.send('Input.dispatchKeyEvent', {
         type: 'keyDown',
         key: 'a',
         code: 'KeyA',
@@ -1080,7 +1249,7 @@ export class BrowserSession {
         windowsVirtualKeyCode: 65,
         nativeVirtualKeyCode: 65,
       });
-      await Input.dispatchKeyEvent({
+      await this.send('Input.dispatchKeyEvent', {
         type: 'keyUp',
         key: 'a',
         code: 'KeyA',
@@ -1090,14 +1259,14 @@ export class BrowserSession {
       });
       
       // 删除选中内容
-      await Input.dispatchKeyEvent({
+      await this.send('Input.dispatchKeyEvent', {
         type: 'keyDown',
         key: 'Backspace',
         code: 'Backspace',
         windowsVirtualKeyCode: 8,
         nativeVirtualKeyCode: 8,
       });
-      await Input.dispatchKeyEvent({
+      await this.send('Input.dispatchKeyEvent', {
         type: 'keyUp',
         key: 'Backspace',
         code: 'Backspace',
@@ -1106,7 +1275,7 @@ export class BrowserSession {
       });
       
       // 插入新文本
-      await Input.insertText({ text: value });
+      await this.send('Input.insertText', { text: value });
       
       logger.info(`Fill element backendNodeId=${backendNodeId} with value: ${value}`);
     } catch (error) {
@@ -1123,7 +1292,7 @@ export class BrowserSession {
     quality?: number;
     fullPage?: boolean;
   }): Promise<{ data: string; format: string } | null> {
-    if (!this.client) return null;
+    if (!this.sessionId) return null;
     try {
       const format = options?.format || 'png';
       const quality = options?.quality || 80;
@@ -1132,7 +1301,7 @@ export class BrowserSession {
 
       if (options?.fullPage) {
         // 获取完整页面尺寸
-        const layoutMetrics = await this.client.Page.getLayoutMetrics();
+        const layoutMetrics = await this.send<{ contentSize: { width: number; height: number } }>('Page.getLayoutMetrics');
         clip = {
           x: 0,
           y: 0,
@@ -1142,7 +1311,7 @@ export class BrowserSession {
         };
       }
 
-      const result = await this.client.Page.captureScreenshot({
+      const result = await this.send<{ data: string }>('Page.captureScreenshot', {
         format,
         quality: format === 'png' ? undefined : quality,
         clip,
@@ -1176,21 +1345,11 @@ export class BrowserSession {
    * 启动 screencast
    */
   private async startScreencast(): Promise<void> {
-    if (!this.client || this.screencastStarted) return;
+    if (!this.sessionId || this.screencastStarted) return;
 
     try {
-      const { Page } = this.client;
-
-      Page.screencastFrame((frame) => {
-        this.emitToViewers('browser:frame', frame.data);
-        Page.screencastFrameAck({ sessionId: frame.sessionId }).catch(() => {});
-      });
-
-      Page.screencastVisibilityChanged((visibility) => {
-        logger.debug(`Screencast visibility changed: ${visibility.visible}`);
-      });
-
-      await Page.startScreencast(SCREENCAST_CONFIG);
+      // screencast 事件会通过 handlePageEvent 处理
+      await this.send('Page.startScreencast', SCREENCAST_CONFIG);
       this.screencastStarted = true;
       logger.debug(`Screencast started for target: ${this.targetId}`);
     } catch (error) {
@@ -1203,10 +1362,10 @@ export class BrowserSession {
    * 停止 screencast
    */
   private async stopScreencast(): Promise<void> {
-    if (!this.client || !this.screencastStarted) return;
+    if (!this.sessionId || !this.screencastStarted) return;
 
     try {
-      await this.client.Page.stopScreencast();
+      await this.send('Page.stopScreencast');
       this.screencastStarted = false;
       logger.debug(`Screencast stopped for target: ${this.targetId}`);
     } catch (error) {
@@ -1218,16 +1377,18 @@ export class BrowserSession {
    * 断开连接
    */
   async disconnect(): Promise<void> {
-    if (this.client) {
+    // 先 detach 当前 session
+    if (this.sessionId && this.browserClient) {
       try {
-        await this.client.Page.stopScreencast();
-        await this.client.close();
+        await this.send('Page.stopScreencast');
+        await this.browserClient.Target.detachFromTarget({ sessionId: this.sessionId });
       } catch (e) {
-        logger.error('Error stopping session:', e);
+        logger.error('Error detaching session:', e);
       }
-      this.client = null;
+      this.sessionId = null;
     }
 
+    // 关闭 browser 连接
     if (this.browserClient) {
       try {
         await this.browserClient.close();

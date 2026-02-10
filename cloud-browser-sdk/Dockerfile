@@ -10,11 +10,11 @@ ARG VITE_API_BASE_URL=http://localhost:4000
 ENV VITE_SDK_SERVER_URL=${VITE_SDK_SERVER_URL}
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 
-# 复制 package 文件
-COPY package*.json ./
+# 复制 package.json
+COPY package.json ./
 
 # 安装所有依赖（包括 devDependencies，用于构建）
-RUN npm ci
+RUN npm install
 
 # 复制源码
 COPY . .
