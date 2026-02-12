@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { CloudBrowserSDK, PageInfo } from '../lib';
 
 // 从环境变量读取配置
@@ -501,6 +502,12 @@ function App() {
         <div className="flex items-center justify-between mb-4">
           <h1 className="text-xl font-bold text-white">Cloud Browser</h1>
           <div className="flex items-center gap-2">
+            <Link
+              to="/video"
+              className="px-3 py-1 rounded text-xs bg-purple-600 text-white hover:bg-purple-700 transition-colors"
+            >
+              演示视频
+            </Link>
             <span className={`px-2 py-1 rounded text-xs ${
               connected ? 'bg-green-600 text-white' : 'bg-red-600 text-white'
             }`}>
